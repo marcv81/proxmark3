@@ -103,6 +103,19 @@ uint32_t GetParity(const uint8_t * pbtCmd, int iLen)
   return dwPar;
 }
 
+//-----------------------------------------------------------------------------
+// An improved version of GetParity for arbitrarily long sequences
+// Parity bits are stored in pbts, starting with the most significant bit of
+// pbts[0]. Length of pbts must be at least (iLen + 7 / 8)
+//-----------------------------------------------------------------------------
+void get_parity(const uint8_t *pbtCmd, int iLen, uint8_t *pbts)
+{
+	memset(pbts, 0, (iLen + 7) / 8);
+	for (int i = 0; i < iLen; i++) {
+		pbts[i / 8] |= ((OddByteParity[pbtCmd[i]]) << (7 - (i % 8)));
+	}
+}
+
 void AppendCrc14443a(uint8_t* data, int len)
 {
   ComputeCrc14443(CRC_14443_A,data,len,data+len,data+len+1);
@@ -1300,81 +1313,97 @@ void ShortFrameFromReader(const uint8_t bt)
     ToSendMax++;
 }
 
+
 //-----------------------------------------------------------------------------
 // Prepare reader command to send to FPGA
-//
+// improved version which supports arbitrarily long messages
 //-----------------------------------------------------------------------------
-void CodeIso14443aAsReaderPar(const uint8_t * cmd, int len, uint32_t dwParity)
+void code_iso14443a_as_reader_par(const uint8_t *cmd, int len, uint8_t *parity_bits)
 {
-  int i, j;
-  int last;
-  uint8_t b;
+	int i, j;
+	int last;
+	uint8_t b;
 
-  ToSendReset();
+	ToSendReset();
 
-  // Start of Communication (Seq. Z)
-  ToSend[++ToSendMax] = SEC_Z;
-  last = 0;
+	// Start of Communication (Seq. Z)
+	ToSend[++ToSendMax] = SEC_Z;
+	last = 0;
 
-  // Generate send structure for the data bits
-  for (i = 0; i < len; i++) {
-    // Get the current byte to send
-    b = cmd[i];
+	// Generate send structure for the data bits
+	for (i = 0; i < len; i++) {
+		// Get the current byte to send
+		b = cmd[i];
 
-    for (j = 0; j < 8; j++) {
-      if (b & 1) {
-        // Sequence X
-    	  ToSend[++ToSendMax] = SEC_X;
-        last = 1;
-      } else {
-        if (last == 0) {
-          // Sequence Z
-        	ToSend[++ToSendMax] = SEC_Z;
-        } else {
-          // Sequence Y
-        	ToSend[++ToSendMax] = SEC_Y;
-          last = 0;
-        }
-      }
-      b >>= 1;
-    }
+		for (j = 0; j < 8; j++) {
+			if (b & 1) {
+				// Sequence X
+				ToSend[++ToSendMax] = SEC_X;
+				last = 1;
+			} else {
+				if (last == 0) {
+					// Sequence Z
+					ToSend[++ToSendMax] = SEC_Z;
+				} else {
+					// Sequence Y
+					ToSend[++ToSendMax] = SEC_Y;
+					last = 0;
+				}
+			}
+			b >>= 1;
+		}
 
-    // Get the parity bit
-    if ((dwParity >> i) & 0x01) {
-      // Sequence X
-    	ToSend[++ToSendMax] = SEC_X;
-      last = 1;
-    } else {
-      if (last == 0) {
-        // Sequence Z
-    	  ToSend[++ToSendMax] = SEC_Z;
-      } else {
-        // Sequence Y
-    	  ToSend[++ToSendMax] = SEC_Y;
-        last = 0;
-      }
-    }
-  }
+		// Get the parity bit
+		if ((parity_bits[i / 8] >> (7 - (i % 8))) & 1) {
+			// Sequence X
+			ToSend[++ToSendMax] = SEC_X;
+			last = 1;
+		} else {
+			if (last == 0) {
+				// Sequence Z
+				ToSend[++ToSendMax] = SEC_Z;
+			} else {
+				// Sequence Y
+				ToSend[++ToSendMax] = SEC_Y;
+				last = 0;
+			}
+		}
+	}
 
-  // End of Communication
-  if (last == 0) {
-    // Sequence Z
-	  ToSend[++ToSendMax] = SEC_Z;
-  } else {
-    // Sequence Y
-	  ToSend[++ToSendMax] = SEC_Y;
-    last = 0;
-  }
-  // Sequence Y
-  ToSend[++ToSendMax] = SEC_Y;
+	// End of Communication
+	if (last == 0) {
+		// Sequence Z
+		ToSend[++ToSendMax] = SEC_Z;
+	} else {
+		// Sequence Y
+		ToSend[++ToSendMax] = SEC_Y;
+		last = 0;
+	}
+	// Sequence Y
+	ToSend[++ToSendMax] = SEC_Y;
 
-  // Just to be sure!
-  ToSend[++ToSendMax] = SEC_Y;
-  ToSend[++ToSendMax] = SEC_Y;
-  ToSend[++ToSendMax] = SEC_Y;
+	// Just to be sure!
+	ToSend[++ToSendMax] = SEC_Y;
+	ToSend[++ToSendMax] = SEC_Y;
+	ToSend[++ToSendMax] = SEC_Y;
 
-  // Convert from last character reference to length
-  ToSendMax++;
+	// Convert from last character reference to length
+	ToSendMax++;
+}
+
+//-----------------------------------------------------------------------------
+// Prepare reader command to send to FPGA
+// old version kept for compatibility
+//-----------------------------------------------------------------------------
+void CodeIso14443aAsReaderPar(const uint8_t * cmd, int len, uint32_t dwParity) {
+	// copy the parity bits into a 4-byte array and use the new function
+	uint8_t parity_array[4] = {0};
+	// bit order needs to be reversed
+	for (uint8_t i = 0; i < 32; i++) {
+		parity_array[i / 8] |= ((dwParity >> i) & 1) << (7 - (i % 8));
+	}
+	
+	code_iso14443a_as_reader_par(cmd, len, parity_array);
 }
 
 //-----------------------------------------------------------------------------
@@ -1606,11 +1635,35 @@ void ReaderTransmitPar(uint8_t* frame, int len, uint32_t par)
   if (tracing) LogTrace(frame,len,0,par,TRUE);
 }
 
+// improved version of ReaderTransmitPar for arbitrarily long messages
+void reader_transmit_par(uint8_t* frame, int len, uint8_t *par) {
+	int wait = 0;
+	int samples = 0;
+	
+	code_iso14443a_as_reader_par(frame,len,par);
+	
+	TransmitFor14443a(ToSend, ToSendMax, &samples, &wait);
+	
+	if(trigger)
+		LED_A_ON();
+	
+	/* NOTE: Tracing is disables because LogTrace doesn't support arbitrarily
+	   long parity bit sequences yet */
+}
 
 void ReaderTransmit(uint8_t* frame, int len)
 {
-  // Generate parity and redirect
-  ReaderTransmitPar(frame,len,GetParity(frame,len));
+	// Generate parity and redirect
+	ReaderTransmitPar(frame,len,GetParity(frame,len));
+}
+
+// improved version of ReaderTransmit for arbitrarily long messages
+void reader_transmit(uint8_t* frame, int len)
+{
+	uint8_t parity_bits[(len + 7) / 8];
+	get_parity(frame, len, parity_bits);
+	// Generate parity and redirect
+	reader_transmit_par(frame,len,parity_bits);
 }
 
 int ReaderReceive(uint8_t* receivedAnswer)
@@ -1743,7 +1796,7 @@ int iso14_apdu(uint8_t * cmd, size_t cmd_len, void * data) {
 	memcpy(real_cmd+2, cmd, cmd_len);
 	AppendCrc14443a(real_cmd,cmd_len+2);
  
-	ReaderTransmit(real_cmd, cmd_len+4);
+	reader_transmit(real_cmd, cmd_len+4);
 	size_t len = ReaderReceive(data);
 	uint8_t * data_bytes = (uint8_t *) data;
 	if (!len)

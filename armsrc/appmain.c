@@ -34,7 +34,7 @@
 // is the order in which they go out on the wire.
 //=============================================================================
 
-uint8_t ToSend[512];
+uint8_t ToSend[4096];
 int ToSendMax;
 static int ToSendBit;
 struct common_area common_area __attribute__((section(".commonarea")));
@@ -741,8 +741,12 @@ void UsbPacketReceived(uint8_t *packet, int len)
 		case CMD_SIMULATE_TAG_ISO_14443a:
 			SimulateIso14443aTag(c->arg[0], c->arg[1], c->arg[2]);  // ## Simulate iso14443a tag - pass tag type & UID
 			break;
+
 		case CMD_EPA_PACE_COLLECT_NONCE:
 			EPA_PACE_Collect_Nonce(c, &ack);
+			break;
+		case CMD_EPA_PACE_REPLAY:
+			EPA_PACE_Replay(c, &ack);
 			break;
 			
 		case CMD_READER_MIFARE:

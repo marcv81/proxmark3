@@ -22,6 +22,7 @@ typedef struct {
 // note: EPA_PACE_GetNonce is declared in apps.h
 
 // general functions
+void EPA_Abort(UsbCommand *ack, uint32_t step, int func_return);
 void EPA_Finish();
 size_t EPA_Parse_CardAccess(uint8_t *data,
                             size_t length,

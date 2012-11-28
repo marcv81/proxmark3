@@ -33,8 +33,30 @@ static const uint8_t apdu_general_authenticate_pace_get_nonce[] = {
 	0x00, // Length: 0 bytes
 };
 
+// APDUs for replaying:
+// MSE: Set AT (initiate PACE)
+static uint8_t apdu_replay_mse_set_at_pace[41];
+// General Authenticate (Get Nonce)
+static uint8_t apdu_replay_general_authenticate_pace_get_nonce[8];
+// General Authenticate (Map Nonce)
+static uint8_t apdu_replay_general_authenticate_pace_map_nonce[75];
+// General Authenticate (Mutual Authenticate)
+static uint8_t apdu_replay_general_authenticate_pace_mutual_authenticate[18];
+// General Authenticate (Perform Key Agreement)
+static uint8_t apdu_replay_general_authenticate_pace_perform_key_agreement[75];
+// pointers to the APDUs (for iterations)
+static uint8_t * const apdus_replay[] = {
+	apdu_replay_mse_set_at_pace,
+	apdu_replay_general_authenticate_pace_get_nonce,
+	apdu_replay_general_authenticate_pace_map_nonce,
+	apdu_replay_general_authenticate_pace_mutual_authenticate,
+	apdu_replay_general_authenticate_pace_perform_key_agreement
+};
+// lengths of the replay APDUs
+static uint8_t apdu_lengths_replay[5];
+
 // MSE: Set AT (only CLA, INS, P1 and P2)
-static const uint8_t apdu_mse_set_at_start[] = {
+static const uint8_t apdu_mse_set_at_pace_start[] = {
 	0x00, // CLA
 	0x22, // INS
 	0xC1, // P1
@@ -75,12 +97,287 @@ static const uint8_t oid_pace_start[] = {
 };
 
 //-----------------------------------------------------------------------------
+// Abort helper function
+// turns off the field, sets some values in the ack and sends it to the PC
+//-----------------------------------------------------------------------------
+void EPA_Abort(UsbCommand *ack, uint32_t step, int func_return)
+{
+	// power down the field
+	EPA_Finish();
+	
+	// step in which the failure occured
+	ack->arg[0] = step;
+	// last return code
+	ack->arg[1] = func_return;
+
+	// send the USB packet
+	UsbSendPacket((void *)ack, sizeof(UsbCommand));
+}
+
+//-----------------------------------------------------------------------------
 // Closes the communication channel and turns off the field
+// The reason why this function doesn't send the ack (like EPA_Abort) is that
+// upon finishing successfully, there probably is data to be sent with the ack.
+// Copying the data (possibly from different sources) into the ack would be too
+// much for a small convenience function like this.
 //-----------------------------------------------------------------------------
 void EPA_Finish()
 {
+	// turn off the field
 	FpgaWriteConfWord(FPGA_MAJOR_MODE_OFF);
 	LEDsoff();
+}
+
+//-----------------------------------------------------------------------------
+// Acquire one encrypted PACE nonce
+//-----------------------------------------------------------------------------
+void EPA_PACE_Collect_Nonce(UsbCommand *c, UsbCommand *ack)
+{
+	/*
+	 * ack layout:
+	 * 	arg:
+	 * 		1. element
+	 *           step where the error occured or 0 if no error occured
+     *       2. element
+     *           return code of the last executed function
+	 * 	d:
+	 * 		Encrypted nonce
+	 */
+
+	// return value of a function
+	int func_return;
+
+	// initialize ack with 0s
+	memset(ack->arg, 0, 12);
+	memset(ack->d.asBytes, 0, 48);
+	
+	// set up communication
+	func_return = EPA_Setup();
+	if (func_return != 0) {
+		EPA_Abort(ack, 1, func_return);
+		return;
+	}
+
+	// increase the timeout (at least some cards really do need this!)
+	iso14a_set_timeout(0x0002FFFF);
+	
+	// read the CardAccess file
+	// this array will hold the CardAccess file
+	uint8_t card_access[256] = {0};
+	int card_access_length = EPA_Read_CardAccess(card_access, 256);
+	// the response has to be at least this big to hold the OID
+	if (card_access_length < 18) {
+		EPA_Abort(ack, 2, card_access_length);
+		return;
+	}
+
+	// this will hold the PACE info of the card
+	pace_version_info_t pace_version_info;
+	// search for the PACE OID
+	func_return = EPA_Parse_CardAccess(card_access,
+	                                   card_access_length,
+	                                   &pace_version_info);
+	if (func_return != 0 || pace_version_info.version == 0) {
+		EPA_Abort(ack, 3, func_return);
+		return;
+	}
+	
+	// initiate the PACE protocol
+	// use the CAN for the password since that doesn't change
+	func_return = EPA_PACE_MSE_Set_AT(pace_version_info, 2);
+	
+	// now get the nonce
+	uint8_t nonce[256] = {0};
+	uint8_t requested_size = (uint8_t)c->arg[0];
+	func_return = EPA_PACE_Get_Nonce(requested_size, nonce);
+	// check if the command succeeded
+	if (func_return < 0)
+	{
+		EPA_Abort(ack, 4, func_return);
+		return;
+	}
+	
+	// save received information
+	ack->arg[1] = func_return;
+	memcpy(ack->d.asBytes, nonce, func_return);
+
+	// all done, return
+	EPA_Finish();
+	UsbSendPacket((uint8_t*) ack, sizeof(UsbCommand));
+}
+
+//-----------------------------------------------------------------------------
+// Performs the "Get Nonce" step of the PACE protocol and saves the returned
+// nonce. The caller is responsible for allocating enough memory to store the
+// nonce. Note that the returned size might be less or than or greater than the
+// requested size!
+// Returns the actual size of the nonce on success or a less-than-zero error
+// code on failure.
+//-----------------------------------------------------------------------------
+int EPA_PACE_Get_Nonce(uint8_t requested_length, uint8_t *nonce)
+{
+	// build the APDU
+	uint8_t apdu[sizeof(apdu_general_authenticate_pace_get_nonce) + 1];
+	// copy the constant part
+	memcpy(apdu,
+	       apdu_general_authenticate_pace_get_nonce,
+	       sizeof(apdu_general_authenticate_pace_get_nonce));
+	// append Le (requested length + 2 due to tag/length taking 2 bytes) in RAPDU
+	apdu[sizeof(apdu_general_authenticate_pace_get_nonce)] = requested_length + 4;
+	
+	// send it
+	uint8_t response_apdu[262];
+	int send_return = iso14_apdu(apdu,
+	                             sizeof(apdu),
+	                             response_apdu);
+	// check if the command succeeded
+	if (send_return < 6
+		|| response_apdu[send_return - 4] != 0x90
+		|| response_apdu[send_return - 3] != 0x00)
+	{
+		return -1;
+	}
+	
+	// if there is no nonce in the RAPDU, return here
+	if (send_return < 10)
+	{
+		// no error
+		return 0;
+	}
+	// get the actual length of the nonce
+	uint8_t nonce_length = response_apdu[5];
+	if (nonce_length > send_return - 10)
+	{
+		nonce_length = send_return - 10;
+	}
+	// copy the nonce
+	memcpy(nonce, response_apdu + 6, nonce_length);
+	
+	return nonce_length;
+}
+
+//-----------------------------------------------------------------------------
+// Initializes the PACE protocol by performing the "MSE: Set AT" step
+// Returns 0 on success or a non-zero error code on failure
+//-----------------------------------------------------------------------------
+int EPA_PACE_MSE_Set_AT(pace_version_info_t pace_version_info, uint8_t password)
+{
+	// create the MSE: Set AT APDU
+	uint8_t apdu[23];
+	// the minimum length (will be increased as more data is added)
+	size_t apdu_length = 20;
+	// copy the constant part
+	memcpy(apdu,
+	       apdu_mse_set_at_pace_start,
+	       sizeof(apdu_mse_set_at_pace_start));
+	// type: OID
+	apdu[5] = 0x80;
+	// length of the OID
+	apdu[6] = sizeof(pace_version_info.oid);
+	// copy the OID
+	memcpy(apdu + 7,
+	       pace_version_info.oid,
+	       sizeof(pace_version_info.oid));
+	// type: password
+	apdu[17] = 0x83;
+	// length: 1
+	apdu[18] = 1;
+	// password
+	apdu[19] = password;
+	// if standardized domain parameters are used, copy the ID
+	if (pace_version_info.parameter_id != 0) {
+		apdu_length += 3;
+		// type: domain parameter
+		apdu[20] = 0x84;
+		// length: 1
+		apdu[21] = 1;
+		// copy the parameter ID
+		apdu[22] = pace_version_info.parameter_id;
+	}
+	// now set Lc to the actual length
+	apdu[4] = apdu_length - 5;
+	// send it
+	uint8_t response_apdu[6];
+	int send_return = iso14_apdu(apdu,
+	                             apdu_length,
+	                             response_apdu);
+	// check if the command succeeded
+	if (send_return != 6
+		|| response_apdu[send_return - 4] != 0x90
+		|| response_apdu[send_return - 3] != 0x00)
+	{
+		return 1;
+	}
+	return 0;
+}
+
+//-----------------------------------------------------------------------------
+// Perform the PACE protocol by replaying given APDUs
+//-----------------------------------------------------------------------------
+void EPA_PACE_Replay(UsbCommand *c, UsbCommand *ack)
+{
+	// initialize ack with 0s
+	memset(ack->arg, 0, 12);
+	memset(ack->d.asBytes, 0, 48);
+	ack->cmd = CMD_ACK;
+	
+	// if an APDU has been passed, save it
+	if (c->arg[0] != 0) {
+		memcpy(apdus_replay[c->arg[0] - 1] + c->arg[1],
+	           c->d.asBytes,
+	           c->arg[2]);
+		// save/update APDU length
+		if (c->arg[1] == 0) {
+			apdu_lengths_replay[c->arg[0] - 1] = c->arg[2];
+		} else {
+			apdu_lengths_replay[c->arg[0] - 1] += c->arg[2];
+		}
+		ack->cmd = CMD_ACK;
+		ack->arg[0] = 0;
+		UsbSendPacket((void *)ack, sizeof(UsbCommand));
+		return;
+	}
+	
+	// return value of a function
+	int func_return;
+	
+	// set up communication
+	func_return = EPA_Setup();
+	if (func_return != 0) {
+		EPA_Abort(ack, 1, func_return);
+		return;
+	}
+
+	// increase the timeout (at least some cards really do need this!)
+	iso14a_set_timeout(0x0003FFFF);
+	
+	// response APDU
+	uint8_t response_apdu[300] = {0};
+	
+	// now replay the data and measure the timings
+	for (int i = 0; i < sizeof(apdu_lengths_replay); i++) {
+		StartCountUS();
+		func_return = iso14_apdu(apdus_replay[i],
+		                         apdu_lengths_replay[i],
+		                         response_apdu);
+		ack->d.asDwords[i] = GetCountUS();
+		// every step but the last one should succeed
+		if (i != sizeof(apdu_lengths_replay)
+		    && (func_return < 6
+		        || response_apdu[func_return - 4] != 0x90
+		        || response_apdu[func_return - 3] != 0x00))
+		{
+			Dbprintf("Status word: 0x%02X%02X",
+			         response_apdu[func_return - 4],
+			         response_apdu[func_return - 3]);
+			EPA_Abort(ack, 2 + i, func_return);
+			return;
+		}
+	}
+	
+	EPA_Finish();
+	UsbSendPacket((void *)ack, sizeof(UsbCommand));
+	return;
 }
 
 //-----------------------------------------------------------------------------
@@ -205,207 +502,6 @@ int EPA_Read_CardAccess(uint8_t *buffer, size_t max_length)
 	to_copy = to_copy < max_length ? to_copy : max_length;
 	memcpy(buffer, response_apdu+2, to_copy);
 	return to_copy;
-}
-
-//-----------------------------------------------------------------------------
-// Abort helper function for EPA_PACE_Collect_Nonce
-// sets relevant data in ack, sends the response
-//-----------------------------------------------------------------------------
-static void EPA_PACE_Collect_Nonce_Abort(UsbCommand *ack, uint8_t step, int func_return)
-{
-	// step in which the failure occured
-	ack->arg[0] = step;
-	// last return code
-	ack->arg[1] = func_return;
-
-	// power down the field
-	EPA_Finish();
-	
-	// send the USB packet
-	UsbSendPacket((void *)ack, sizeof(UsbCommand));
-}
-
-//-----------------------------------------------------------------------------
-// Acquire one encrypted PACE nonce
-//-----------------------------------------------------------------------------
-void EPA_PACE_Collect_Nonce(UsbCommand *c, UsbCommand *ack)
-{
-	/*
-	 * ack layout:
-	 * 	arg:
-	 * 		1. element
-	 *           step where the error occured or 0 if no error occured
-     *       2. element
-     *           return code of the last executed function
-	 * 	d:
-	 * 		Encrypted nonce
-	 */
-
-	// return value of a function
-	int func_return;
-
-	// initialize ack with 0s
-	memset(ack->arg, 0, 12);
-	memset(ack->d.asBytes, 0, 48);
-	
-	// set up communication
-	func_return = EPA_Setup();
-	if (func_return != 0) {
-		EPA_PACE_Collect_Nonce_Abort(ack, 1, func_return);
-		return;
-	}
-
-	// increase the timeout (at least some cards really do need this!)
-	iso14a_set_timeout(0x0002FFFF);
-	
-	// read the CardAccess file
-	// this array will hold the CardAccess file
-	uint8_t card_access[256] = {0};
-	int card_access_length = EPA_Read_CardAccess(card_access, 256);
-	// the response has to be at least this big to hold the OID
-	if (card_access_length < 18) {
-		EPA_PACE_Collect_Nonce_Abort(ack, 2, card_access_length);
-		return;
-	}
-
-	// this will hold the PACE info of the card
-	pace_version_info_t pace_version_info;
-	// search for the PACE OID
-	func_return = EPA_Parse_CardAccess(card_access,
-	                                   card_access_length,
-	                                   &pace_version_info);
-	if (func_return != 0 || pace_version_info.version == 0) {
-		EPA_PACE_Collect_Nonce_Abort(ack, 3, func_return);
-		return;
-	}
-	
-	// initiate the PACE protocol
-	// use the CAN for the password since that doesn't change
-	func_return = EPA_PACE_MSE_Set_AT(pace_version_info, 2);
-	
-	// now get the nonce
-	uint8_t nonce[256] = {0};
-	uint8_t requested_size = (uint8_t)c->arg[0];
-	func_return = EPA_PACE_Get_Nonce(requested_size, nonce);
-	// check if the command succeeded
-	if (func_return < 0)
-	{
-		EPA_PACE_Collect_Nonce_Abort(ack, 4, func_return);
-		return;
-	}
-	
-	// save received information
-	ack->arg[1] = func_return;
-	memcpy(ack->d.asBytes, nonce, func_return);
-
-	// all done, return
-	EPA_Finish();
-	UsbSendPacket((void *)ack, sizeof(UsbCommand));
-}
-
-//-----------------------------------------------------------------------------
-// Performs the "Get Nonce" step of the PACE protocol and saves the returned
-// nonce. The caller is responsible for allocating enough memory to store the
-// nonce. Note that the returned size might be less or than or greater than the
-// requested size!
-// Returns the actual size of the nonce on success or a less-than-zero error
-// code on failure.
-//-----------------------------------------------------------------------------
-int EPA_PACE_Get_Nonce(uint8_t requested_length, uint8_t *nonce)
-{
-	// build the APDU
-	uint8_t apdu[sizeof(apdu_general_authenticate_pace_get_nonce) + 1];
-	// copy the constant part
-	memcpy(apdu,
-	       apdu_general_authenticate_pace_get_nonce,
-	       sizeof(apdu_general_authenticate_pace_get_nonce));
-	// append Le (requested length + 2 due to tag/length taking 2 bytes) in RAPDU
-	apdu[sizeof(apdu_general_authenticate_pace_get_nonce)] = requested_length + 4;
-	
-	// send it
-	uint8_t response_apdu[262];
-	int send_return = iso14_apdu(apdu,
-	                             sizeof(apdu),
-	                             response_apdu);
-	// check if the command succeeded
-	if (send_return < 6
-		|| response_apdu[send_return - 4] != 0x90
-		|| response_apdu[send_return - 3] != 0x00)
-	{
-		return -1;
-	}
-	
-	// if there is no nonce in the RAPDU, return here
-	if (send_return < 10)
-	{
-		// no error
-		return 0;
-	}
-	// get the actual length of the nonce
-	uint8_t nonce_length = response_apdu[5];
-	if (nonce_length > send_return - 10)
-	{
-		nonce_length = send_return - 10;
-	}
-	// copy the nonce
-	memcpy(nonce, response_apdu + 6, nonce_length);
-	
-	return nonce_length;
-}
-
-//-----------------------------------------------------------------------------
-// Initializes the PACE protocol by performing the "MSE: Set AT" step
-// Returns 0 on success or a non-zero error code on failure
-//-----------------------------------------------------------------------------
-int EPA_PACE_MSE_Set_AT(pace_version_info_t pace_version_info, uint8_t password)
-{
-	// create the MSE: Set AT APDU
-	uint8_t apdu[23];
-	// the minimum length (will be increased as more data is added)
-	size_t apdu_length = 20;
-	// copy the constant part
-	memcpy(apdu,
-	       apdu_mse_set_at_start,
-	       sizeof(apdu_mse_set_at_start));
-	// type: OID
-	apdu[5] = 0x80;
-	// length of the OID
-	apdu[6] = sizeof(pace_version_info.oid);
-	// copy the OID
-	memcpy(apdu + 7,
-	       pace_version_info.oid,
-	       sizeof(pace_version_info.oid));
-	// type: password
-	apdu[17] = 0x83;
-	// length: 1
-	apdu[18] = 1;
-	// password
-	apdu[19] = password;
-	// if standardized domain parameters are used, copy the ID
-	if (pace_version_info.parameter_id != 0) {
-		apdu_length += 3;
-		// type: domain parameter
-		apdu[20] = 0x84;
-		// length: 1
-		apdu[21] = 1;
-		// copy the parameter ID
-		apdu[22] = pace_version_info.parameter_id;
-	}
-	// now set Lc to the actual length
-	apdu[4] = apdu_length - 5;
-	// send it
-	uint8_t response_apdu[6];
-	int send_return = iso14_apdu(apdu,
-	                             apdu_length,
-	                             response_apdu);
-	// check if the command succeeded
-	if (send_return != 6
-		|| response_apdu[send_return - 4] != 0x90
-		|| response_apdu[send_return - 3] != 0x00)
-	{
-		return 1;
-	}
-	return 0;
 }
 
 //-----------------------------------------------------------------------------

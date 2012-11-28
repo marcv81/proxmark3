@@ -137,13 +137,15 @@ void ReaderIso14443a(UsbCommand * c, UsbCommand * ack);
 // Also used in iclass.c
 int RAMFUNC LogTrace(const uint8_t * btBytes, int iLen, int iSamples, uint32_t dwParity, int bReader);
 uint32_t GetParity(const uint8_t * pbtCmd, int iLen);
+void GetParityLong(const uint8_t *pbtCmd, int iLen, uint8_t *pbts);
 void iso14a_set_trigger(int enable);
 void iso14a_clear_trace(void);
 void iso14a_set_tracing(int enable);
 void RAMFUNC SniffMifare(uint8_t param);
 
 /// epa.h
-void EPA_PACE_Collect_Nonce(UsbCommand * c, UsbCommand * ack);
+void EPA_PACE_Collect_Nonce(UsbCommand *c, UsbCommand *ack);
+void EPA_PACE_Replay(UsbCommand *c, UsbCommand *ack);
 
 // mifarecmd.h
 void ReaderMifare(uint32_t parameter);
