@@ -42,7 +42,7 @@ void SendCommand(UsbCommand *c)
   printf("Sending %d bytes\n", sizeof(UsbCommand));
 #endif
   current_command = c->cmd;
-  ret = usb_bulk_write(devh, 0x01, (char*)c, sizeof(UsbCommand), 1000);
+  ret = usb_bulk_write(devh, 0x01, (char*)c, sizeof(UsbCommand), 5000);
   if (ret<0) {
     error_occured = 1;
     if (return_on_error)
@@ -68,7 +68,7 @@ bool ReceiveCommandPoll(UsbCommand *c)
   int ret;
 
   memset(c, 0, sizeof (UsbCommand));
-  ret = usb_bulk_read(devh, 0x82, (char*)c, sizeof(UsbCommand), 500);
+  ret = usb_bulk_read(devh, 0x82, (char*)c, sizeof(UsbCommand), 5000);
   if (ret<0) {
     if (ret != -ETIMEDOUT) {
       error_occured = 1;
